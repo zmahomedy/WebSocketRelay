@@ -14,10 +14,10 @@ namespace WebSocketRelay
 // ------------------------------------------------------------------
 enum WR_PROFILE_PRESET
 {
-   WR_PRESET_DEFAULT = 0,
-   WR_PRESET_MOBILE  = 1,
-   WR_PRESET_ONSITE  = 2,   // "lan" maps here
-   WR_PRESET_DATACENTER = 3 // "dc" maps here
+   WR_PRESET_DEFAULT     = 0,
+   WR_PRESET_MOBILE      = 1,
+   WR_PRESET_ONSITE      = 2,   // "lan" maps here
+   WR_PRESET_DATACENTER  = 3    // "dc" maps here
 };
 
 // ------------------------------------------------------------------
@@ -39,13 +39,15 @@ struct WRProfile
    int  wd_max_ms;            // max backoff (ms)
    int  wd_jitter_pct;        // ± jitter around backoff (percent)
 
-   // ---- Transport timeouts (milliseconds) ----
-   int  connect_timeout_ms;   // TCP/TLS connect slice or blocking connect
-   int  handshake_timeout_ms; // HTTP Upgrade handshake overall deadline
+   // ---- Transport timeouts & handshake caps (milliseconds/bytes) ----
+   int  connect_timeout_ms;         // TCP/TLS connect slice or blocking connect
+   int  handshake_timeout_ms;       // HTTP Upgrade handshake overall deadline
+   int  handshake_max_header_bytes; // max header bytes to accept during handshake (slow-loris guard)
 
    // ---- TX shaping / fragmentation ----
    int  tx_cap_bytes;         // outbound queue cap (bytes)
-   int  tx_fragment_bytes;    // fragmentation size for large messages (bytes)
+   int  tx_fragment_bytes;    // socket write slice size (bytes)
+   int  tx_ws_frame_bytes;    // target payload bytes per WS frame (auto-frag; 0 = lib default)
    int  frags_per_dispatch;   // max TX fragments to flush per Dispatch() tick
 
    // ---- Dispatch budget ----
@@ -78,13 +80,16 @@ void WRProfileSanitize(WRProfile &p)
    p.wd_max_ms        = WRClamp(p.wd_max_ms,        p.wd_min_ms, 600000);
    p.wd_jitter_pct    = WRClamp(p.wd_jitter_pct,    0,   75);
 
-   // Transport
-   p.connect_timeout_ms   = WRClamp(p.connect_timeout_ms,   300, 600000);
-   p.handshake_timeout_ms = WRClamp(p.handshake_timeout_ms, 300, 600000);
+   // Transport / handshake
+   p.connect_timeout_ms        = WRClamp(p.connect_timeout_ms,        300, 600000);
+   p.handshake_timeout_ms      = WRClamp(p.handshake_timeout_ms,      300, 600000);
+   p.handshake_max_header_bytes= WRClamp(p.handshake_max_header_bytes,1024, 65536);
 
    // TX / fragmentation
    p.tx_cap_bytes       = WRClamp(p.tx_cap_bytes,       16*1024,     32*1024*1024);
    p.tx_fragment_bytes  = WRClamp(p.tx_fragment_bytes,  1024,        1*1024*1024);
+   if(p.tx_ws_frame_bytes <= 0) p.tx_ws_frame_bytes = 16*1024; // default 16 KiB if unset
+   p.tx_ws_frame_bytes  = WRClamp(p.tx_ws_frame_bytes,  1024,        1*1024*1024);
    p.frags_per_dispatch = WRClamp(p.frags_per_dispatch, 1,           64);
 
    // Dispatch budget
@@ -116,13 +121,15 @@ WRProfile WRProfileDefault()
    p.wd_max_ms        = 30000;
    p.wd_jitter_pct    = 25;
 
-   // Transport
-   p.connect_timeout_ms   = 4000;
-   p.handshake_timeout_ms = 6000;
+   // Transport / handshake
+   p.connect_timeout_ms        = 4000;
+   p.handshake_timeout_ms      = 6000;
+   p.handshake_max_header_bytes= 8*1024; // 8 KiB default
 
    // TX / fragmentation
    p.tx_cap_bytes       = 1*1024*1024;  // 1 MiB
-   p.tx_fragment_bytes  = 64*1024;      // 64 KiB
+   p.tx_fragment_bytes  = 64*1024;      // socket slice
+   p.tx_ws_frame_bytes  = 16*1024;      // WS frame payload target
    p.frags_per_dispatch = 8;
 
    // Dispatch
@@ -142,13 +149,15 @@ WRProfile WRProfileMobileTight()
 {
    WRProfile p = WRProfileDefault();
 
-   // Transport
-   p.connect_timeout_ms   = 5000;
-   p.handshake_timeout_ms = 7000;
+   // Transport / handshake
+   p.connect_timeout_ms        = 5000;
+   p.handshake_timeout_ms      = 7000;
+   p.handshake_max_header_bytes= 8*1024; // keep tight on mobile
 
    // TX / fragmentation
    p.tx_cap_bytes       = 512*1024;
    p.tx_fragment_bytes  = 32*1024;
+   p.tx_ws_frame_bytes  = 8*1024;       // smaller frames over radio/HL links
    p.frags_per_dispatch = 6;
 
    // HB
@@ -181,13 +190,15 @@ WRProfile WRProfileOnsiteLAN()
 {
    WRProfile p = WRProfileDefault();
 
-   // Transport
-   p.connect_timeout_ms   = 2000;
-   p.handshake_timeout_ms = 3000;
+   // Transport / handshake
+   p.connect_timeout_ms        = 2000;
+   p.handshake_timeout_ms      = 3000;
+   p.handshake_max_header_bytes= 16*1024; // LAN/DC can afford larger headers
 
    // TX / fragmentation
    p.tx_cap_bytes       = 2*1024*1024;
    p.tx_fragment_bytes  = 64*1024;
+   p.tx_ws_frame_bytes  = 32*1024;      // fatter frames on LAN
    p.frags_per_dispatch = 10;
 
    // HB
@@ -215,13 +226,15 @@ WRProfile WRProfileLowLatDC()
 {
    WRProfile p = WRProfileDefault();
 
-   // Transport
-   p.connect_timeout_ms   = 1500;
-   p.handshake_timeout_ms = 2500;
+   // Transport / handshake
+   p.connect_timeout_ms        = 1500;
+   p.handshake_timeout_ms      = 2500;
+   p.handshake_max_header_bytes= 16*1024;
 
    // TX / fragmentation
    p.tx_cap_bytes       = 4*1024*1024;
    p.tx_fragment_bytes  = 96*1024;
+   p.tx_ws_frame_bytes  = 64*1024;      // DC pipes handle it well
    p.frags_per_dispatch = 12;
 
    // HB
@@ -255,13 +268,11 @@ WRProfile WRProfileDatacenter()
 // ------------------------------------------------------------------
 WR_PROFILE_PRESET WRNameToPreset(string name)
 {
-   StringToLower(name);
-   if(name=="mobile")      return WR_PRESET_MOBILE;
-   if(name=="onsite")      return WR_PRESET_ONSITE;
-   if(name=="lan")         return WR_PRESET_ONSITE;
-   if(name=="datacenter")  return WR_PRESET_DATACENTER;
-   if(name=="dc")          return WR_PRESET_DATACENTER;
-   // default / unknown
+   if(StringCompare(name,"mobile",true)     == 0) return WR_PRESET_MOBILE;
+   if(StringCompare(name,"onsite",true)     == 0) return WR_PRESET_ONSITE;
+   if(StringCompare(name,"lan",true)        == 0) return WR_PRESET_ONSITE;
+   if(StringCompare(name,"datacenter",true) == 0) return WR_PRESET_DATACENTER;
+   if(StringCompare(name,"dc",true)         == 0) return WR_PRESET_DATACENTER;
    return WR_PRESET_DEFAULT;
 }
 
