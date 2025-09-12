@@ -57,6 +57,9 @@ struct WRProfile
    int  rx_max_message_bytes;     // hard cap for a single reassembled message
    int  rx_max_fragments;         // max fragments per message
    int  rx_reassembly_window_ms;  // time window to hold partial frames
+   
+   //tls
+   bool force_tls_handshake_on_443; // default = false
 };
 
 // ------------------------------------------------------------------
@@ -115,8 +118,12 @@ WRProfile WRProfileDefault()
    p.hb_grace_misses  = 2;
    p.hb_prime_ping    = true;
 
+   //TLS
+   p.force_tls_handshake_on_443 = false;
+   
    // WD
    p.wd_enable        = true;
+   
    p.wd_min_ms        = 1000;
    p.wd_max_ms        = 30000;
    p.wd_jitter_pct    = 25;
