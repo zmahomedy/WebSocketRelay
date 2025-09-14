@@ -38,6 +38,13 @@ struct WRProfile
    int  wd_min_ms;            // min backoff (ms)
    int  wd_max_ms;            // max backoff (ms)
    int  wd_jitter_pct;        // ± jitter around backoff (percent)
+   
+   //watchdog event timers offline to fatal
+   int wd_tier1_ms;          // OFFLINE after 10 s
+   int wd_tier2_ms;          // CRITICAL after 60 s
+   int wd_tier3_ms;          // // FATAL after 5 min
+   int wd_giveup_ms;
+   
 
    // ---- Transport timeouts & handshake caps (milliseconds/bytes) ----
    int  connect_timeout_ms;         // TCP/TLS connect slice or blocking connect
@@ -49,6 +56,7 @@ struct WRProfile
    int  tx_fragment_bytes;    // socket write slice size (bytes)
    int  tx_ws_frame_bytes;    // target payload bytes per WS frame (auto-frag; 0 = lib default)
    int  frags_per_dispatch;   // max TX fragments to flush per Dispatch() tick
+   
 
    // ---- Dispatch budget ----
    int  cb_max_per_dispatch;  // max callbacks delivered per Dispatch() tick
@@ -57,6 +65,8 @@ struct WRProfile
    int  rx_max_message_bytes;     // hard cap for a single reassembled message
    int  rx_max_fragments;         // max fragments per message
    int  rx_reassembly_window_ms;  // time window to hold partial frames
+   int  rx_read_chunk_bytes;   // NEW: read slice size for socket RX (default 4096)
+
    
    //tls
    bool force_tls_handshake_on_443; // default = false
@@ -82,7 +92,25 @@ void WRProfileSanitize(WRProfile &p)
    p.wd_min_ms        = WRClamp(p.wd_min_ms,        100, 600000);
    p.wd_max_ms        = WRClamp(p.wd_max_ms,        p.wd_min_ms, 600000);
    p.wd_jitter_pct    = WRClamp(p.wd_jitter_pct,    0,   75);
+   
+   // --- NEW: Watchdog tier thresholds (ms) ---
+   // Allow 1s .. 1h for tiers, then enforce tier1 <= tier2 <= tier3
+   p.wd_tier1_ms = WRClamp(p.wd_tier1_ms, 1000, 3600000);
+   p.wd_tier2_ms = WRClamp(p.wd_tier2_ms, 1000, 3600000);
+   p.wd_tier3_ms = WRClamp(p.wd_tier3_ms, 1000, 3600000);
 
+   if(p.wd_tier2_ms < p.wd_tier1_ms) p.wd_tier2_ms = p.wd_tier1_ms;
+   if(p.wd_tier3_ms < p.wd_tier2_ms) p.wd_tier3_ms = p.wd_tier2_ms;
+   
+   // Give-up (0 = disabled). If >0, enforce it's not below tier3 and not absurdly large.
+   if(p.wd_giveup_ms < 0) p.wd_giveup_ms = 0;
+   if(p.wd_giveup_ms > 0) {
+      // clamp to [tier3, 6h]
+      const int min_giveup = p.wd_tier3_ms;
+      const int max_giveup = 21600000; // 6 hours
+      p.wd_giveup_ms = WRClamp(p.wd_giveup_ms, min_giveup, max_giveup);
+   }
+   
    // Transport / handshake
    p.connect_timeout_ms        = WRClamp(p.connect_timeout_ms,        300, 600000);
    p.handshake_timeout_ms      = WRClamp(p.handshake_timeout_ms,      300, 600000);
@@ -127,6 +155,13 @@ WRProfile WRProfileDefault()
    p.wd_min_ms        = 1000;
    p.wd_max_ms        = 30000;
    p.wd_jitter_pct    = 25;
+   
+   p.wd_tier1_ms = 10000; // OFFLINE after 10 s
+   p.wd_tier2_ms = 60000; // CRITICAL after 60 s
+   p.wd_tier3_ms = 300000; // FATAL after 5 min
+
+   // Give-up (mission-critical default: disabled)
+   p.wd_giveup_ms = 0;
 
    // Transport / handshake
    p.connect_timeout_ms        = 4000;
@@ -146,6 +181,8 @@ WRProfile WRProfileDefault()
    p.rx_max_message_bytes    = 8*1024*1024; // 8 MiB
    p.rx_max_fragments        = 128;
    p.rx_reassembly_window_ms = 30000;       // 30s
+   p.rx_read_chunk_bytes = 4096;
+
 
    WRProfileSanitize(p);
    return p;
@@ -179,6 +216,12 @@ WRProfile WRProfileMobileTight()
    p.wd_min_ms      = 1500;
    p.wd_max_ms      = 45000;
    p.wd_jitter_pct  = 35;
+   p.wd_giveup_ms  = 0;      // keep retrying
+   
+   // Tiers
+   p.wd_tier1_ms = 15000;   // 15 s
+   p.wd_tier2_ms = 90000;   // 90 s
+   p.wd_tier3_ms = 300000;  // 5 min
 
    // Dispatch
    p.cb_max_per_dispatch = 64;
@@ -187,6 +230,7 @@ WRProfile WRProfileMobileTight()
    p.rx_max_message_bytes    = 2*1024*1024; // 2 MiB
    p.rx_max_fragments        = 64;
    p.rx_reassembly_window_ms = 20000;
+   p.rx_read_chunk_bytes = 4096;
 
    WRProfileSanitize(p);
    return p;
@@ -214,12 +258,18 @@ WRProfile WRProfileOnsiteLAN()
    p.hb_idle_sec      = 12;
    p.hb_interval_sec  = 4;
    p.hb_grace_misses  = 3;
+   p.wd_giveup_ms  = 0;      // keep retrying
 
    // WD
    p.wd_enable      = true;
    p.wd_min_ms      = 800;
    p.wd_max_ms      = 15000;
    p.wd_jitter_pct  = 20;
+   
+   // Tiers
+   p.wd_tier1_ms = 7000;    // 7 s
+   p.wd_tier2_ms = 30000;   // 30 s
+   p.wd_tier3_ms = 120000;  // 2 min
 
    // Dispatch
    p.cb_max_per_dispatch = 192;
@@ -250,12 +300,18 @@ WRProfile WRProfileLowLatDC()
    p.hb_idle_sec      = 10;
    p.hb_interval_sec  = 3;
    p.hb_grace_misses  = 3;
-
+   
    // WD
    p.wd_enable      = true;
    p.wd_min_ms      = 500;
    p.wd_max_ms      = 10000;
    p.wd_jitter_pct  = 15;
+   p.wd_giveup_ms  = 0;      // keep retrying
+   
+   // Tiers
+   p.wd_tier1_ms = 5000;    // 5 s
+   p.wd_tier2_ms = 20000;   // 20 s
+   p.wd_tier3_ms = 60000;   // 60 s
 
    // Dispatch
    p.cb_max_per_dispatch = 256;
